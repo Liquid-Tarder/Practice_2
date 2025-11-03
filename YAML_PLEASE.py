@@ -1,9 +1,14 @@
 import yaml
 import sys
 import os
-from typing import Dict, Any
+from typing import Dict, Any, List
 import logging
 import io
+import subprocess
+import tempfile
+import shutil
+import requests
+import toml
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -14,20 +19,20 @@ class ConfigurationError(Exception):
     pass
 
 
-class DependencyAnalyzer:
-    """Main class for handling configuration and analysis"""
+class CargoDependencyAnalyzer:
+    """Main class for handling Cargo package dependency analysis"""
     
     VALID_MODES = ['analyze', 'test', 'visualize', 'report']
     
     def __init__(self, config_file: str = "config.yaml"):
         self.config_file = config_file
         self.config: Dict[str, Any] = {}
+        self.temp_dir = None
         self.load_configuration()
     
     def load_configuration(self) -> None:
         """Load and validate configuration from YAML file"""
         try:
-
             if not os.path.exists(self.config_file):
                 raise ConfigurationError(f"Конфиг файл '{self.config_file}' не найден")
             
@@ -93,6 +98,76 @@ class DependencyAnalyzer:
         if not isinstance(filter_substring, str):
             raise ConfigurationError("filter_substring must be a string")
     
+    def clone_repository(self) -> str:
+        """Clone the repository to a temporary directory"""
+        try:
+            self.temp_dir = tempfile.mkdtemp()
+            logger.info(f"Клонируем репозиторий в: {self.temp_dir}")
+            
+            result = subprocess.run([
+                'git', 'clone', 
+                self.config['repository_url'], 
+                self.temp_dir
+            ], capture_output=True, text=True, check=True)
+            
+            logger.info("Репозиторий успешно клонирован")
+            return self.temp_dir
+            
+        except subprocess.CalledProcessError as e:
+            raise ConfigurationError(f"Ошибка клонирования репозитория: {e.stderr}")
+    
+    def find_cargo_toml(self, directory: str) -> str:
+        """Find Cargo.toml in the repository"""
+        cargo_toml_path = os.path.join(directory, 'Cargo.toml')
+        
+        if os.path.exists(cargo_toml_path):
+            return cargo_toml_path
+        
+        for root, dirs, files in os.walk(directory):
+            if 'Cargo.toml' in files:
+                return os.path.join(root, 'Cargo.toml')
+        
+        raise ConfigurationError("Cargo.toml не найден в репозитории")
+    
+    def extract_dependencies(self, cargo_toml_path: str) -> Dict[str, Any]:
+        """Extract dependencies from Cargo.toml"""
+        try:
+            with open(cargo_toml_path, 'r', encoding='utf-8') as file:
+                cargo_data = toml.load(file)
+            
+            dependencies = {}
+            
+            if 'dependencies' in cargo_data:
+                dependencies.update(cargo_data['dependencies'])
+
+            if 'dev-dependencies' in cargo_data:
+                dependencies.update(cargo_data['dev-dependencies'])
+            
+
+            if 'build-dependencies' in cargo_data:
+                dependencies.update(cargo_data['build-dependencies'])
+            
+            return dependencies
+            
+        except Exception as e:
+            raise ConfigurationError(f"Ошибка парсинга Cargo.toml: {e}")
+    
+    def format_dependency(self, name: str, dep_spec: Any) -> str:
+        """Format dependency information based on its type"""
+        if isinstance(dep_spec, str):
+            return f"{name} = \"{dep_spec}\""
+        elif isinstance(dep_spec, dict):
+            if 'git' in dep_spec:
+                return f"{name} = {{ git = \"{dep_spec['git']}\" }}"
+            elif 'path' in dep_spec:
+                return f"{name} = {{ path = \"{dep_spec['path']}\" }}"
+            elif 'version' in dep_spec:
+                return f"{name} = \"{dep_spec['version']}\""
+            else:
+                return f"{name} = {dep_spec}"
+        else:
+            return f"{name} = {dep_spec}"
+    
     def display_configuration(self) -> None:
         """Display all user-configurable parameters in key-value format"""
         print("=== Юзером конфигурированый параметр ===")
@@ -101,20 +176,48 @@ class DependencyAnalyzer:
         print("====================================")
     
     def analyze_dependencies(self) -> None:
-        """
-        Main analysis method (stub for this stage)
-        In future stages, this would perform the actual dependency analysis
-        """
+        """Main analysis method for Rust/Cargo dependencies"""
         logger.info(f"Начнем же анализ: {self.config['package_name']}")
         logger.info(f"Репризеторий: {self.config['repository_url']}")
         logger.info(f"Режим: {self.config['working_mode']}")
-        logger.info(f"Макс глубина: {self.config['max_depth']}")
-        logger.info(f"Фильтер: {self.config['filter_substring']}")
         
-        print("\n=== Итоги веселья ===")
-        print("Отличная конфигурация")
-        print("Параметры на высоте")
-        print("Все выполнено хорошо")
+        try:
+
+            repo_dir = self.clone_repository()
+            
+
+            cargo_toml_path = self.find_cargo_toml(repo_dir)
+            logger.info(f"Найден Cargo.toml: {cargo_toml_path}")
+            
+
+            dependencies = self.extract_dependencies(cargo_toml_path)
+            
+
+            self.display_dependency_analysis(dependencies)
+            
+        finally:
+
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+    
+    def display_dependency_analysis(self, dependencies: Dict[str, Any]) -> None:
+        """Display the dependency analysis results"""
+        print("\n=== ПРЯМЫЕ ЗАВИСИМОСТИ ===")
+        
+        filtered_deps = {
+            name: spec for name, spec in dependencies.items() 
+            if self.config['filter_substring'] in name or not self.config['filter_substring']
+        }
+        
+        if not filtered_deps:
+            print("Нет зависимостей, соответствующих фильтру")
+        else:
+            for name, spec in filtered_deps.items():
+                formatted_dep = self.format_dependency(name, spec)
+                print(formatted_dep)
+        
+        print(f"\nВсего зависимостей: {len(dependencies)}")
+        print(f"Отфильтровано: {len(filtered_deps)}")
         print("===================================")
 
 
@@ -122,13 +225,8 @@ def main():
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     """Main entry point of the application"""
     try:
-
-        analyzer = DependencyAnalyzer("config.yaml")
-        
-
+        analyzer = CargoDependencyAnalyzer("config.yaml")
         analyzer.display_configuration()
-        
-
         analyzer.analyze_dependencies()
         
         logger.info("Сделано...")
