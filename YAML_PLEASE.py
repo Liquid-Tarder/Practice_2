@@ -1,10 +1,13 @@
-import yaml
 import sys
 import os
 import re
-from typing import Dict, Any, List, Set, Optional
-from collections import deque
+import subprocess
+import json
+from datetime import datetime
+from typing import Dict, Any, List, Set, Optional, Tuple
+from collections import deque, defaultdict
 import logging
+import importlib.util
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -15,41 +18,125 @@ class ConfigurationError(Exception):
     pass
 
 
+class GitManager:
+    """Handles Git operations for saving results"""
+    
+    @staticmethod
+    def commit_results(commit_message: str, files_to_add: List[str] = None) -> bool:
+        """Commit analysis results to the repository"""
+        try:
+
+            if files_to_add:
+                for file in files_to_add:
+                    subprocess.run(['git', 'add', file], check=True, capture_output=True)
+            else:
+                subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
+
+            result = subprocess.run(
+                ['git', 'commit', '-m', commit_message],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            logger.info(f"Successfully committed results: {commit_message}")
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Git commit failed: {e}")
+            if e.stderr:
+                logger.error(f"Git error: {e.stderr}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during Git commit: {e}")
+            return False
+    
+    @staticmethod
+    def get_current_branch() -> str:
+        """Get current Git branch name"""
+        try:
+            result = subprocess.run(
+                ['git', 'branch', '--show-current'],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            return result.stdout.strip()
+        except Exception as e:
+            logger.warning(f"Could not determine current branch: {e}")
+            return "unknown"
+
+
 class DependencyAnalyzer:
     """Main class for handling configuration and analysis"""
     
-    VALID_MODES = ['analyze', 'test', 'visualize', 'report']
+    VALID_MODES = ['analyze', 'test', 'visualize', 'report', 'display_loading_order']
     
-    def __init__(self, config_file: str = "config.yaml"):
+    def __init__(self, config_file: str = "config.py"):
         self.config_file = config_file
         self.config: Dict[str, Any] = {}
         self.dependency_graph: Dict[str, List[str]] = {}
         self.visited: Set[str] = set()
+        self.loading_order: List[str] = []
         self.load_configuration()
     
     def load_configuration(self) -> None:
-        """Load and validate configuration from YAML file"""
+        """Load and validate configuration from Python file"""
         try:
             if not os.path.exists(self.config_file):
                 raise ConfigurationError(f"Configuration file '{self.config_file}' not found")
             
             if not os.access(self.config_file, os.R_OK):
                 raise ConfigurationError(f"Configuration file '{self.config_file}' is not readable")
-            
-            with open(self.config_file, 'r', encoding='utf-8') as file:
-                self.config = yaml.safe_load(file)
+            self.config = self._load_python_config()
             
             if self.config is None:
                 raise ConfigurationError("Configuration file is empty or invalid")
             
             self._validate_configuration()
             
-        except yaml.YAMLError as e:
-            raise ConfigurationError(f"Invalid YAML format: {e}")
-        except IOError as e:
-            raise ConfigurationError(f"Error reading configuration file: {e}")
         except Exception as e:
-            raise ConfigurationError(f"Unexpected error loading configuration: {e}")
+            raise ConfigurationError(f"Error loading configuration from Python file: {e}")
+    
+    def _load_python_config(self) -> Dict[str, Any]:
+        """Load configuration from a Python file"""
+        try:
+            spec = importlib.util.spec_from_file_location("config_module", self.config_file)
+            if spec is None:
+                raise ConfigurationError(f"Could not load specification from '{self.config_file}'")
+            
+            config_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(config_module)
+            config_dict = {}
+            required_params = [
+                'package_name', 
+                'repository_url', 
+                'working_mode', 
+                'max_depth', 
+                'filter_substring'
+            ]
+            
+            for param in required_params:
+                if hasattr(config_module, param):
+                    config_dict[param] = getattr(config_module, param)
+                else:
+                    raise ConfigurationError(f"Missing required parameter '{param}' in configuration file")
+            
+            optional_params = {
+                'output_format': 'json',
+                'verbose': False,
+                'save_results': True
+            }
+            
+            for param, default_value in optional_params.items():
+                if hasattr(config_module, param):
+                    config_dict[param] = getattr(config_module, param)
+                else:
+                    config_dict[param] = default_value
+            
+            return config_dict
+            
+        except Exception as e:
+            raise ConfigurationError(f"Error parsing Python configuration file: {e}")
     
     def _validate_configuration(self) -> None:
         """Validate all configuration parameters"""
@@ -105,18 +192,15 @@ class DependencyAnalyzer:
                     if not line or line.startswith('#'):
                         continue
                     
-                    # Expected format: "PACKAGE: DEP1, DEP2, DEP3"
                     if ':' in line:
                         package, deps = line.split(':', 1)
                         package = package.strip()
                         
-                        # Validate package name format (uppercase letters only)
                         if not re.match(r'^[A-Z]+$', package):
                             logger.warning(f"Invalid package name format: {package}. Skipping.")
                             continue
                         
                         dependencies = [dep.strip() for dep in deps.split(',') if dep.strip()]
-                        # Validate dependency names
                         valid_dependencies = []
                         for dep in dependencies:
                             if re.match(r'^[A-Z]+$', dep):
@@ -135,6 +219,68 @@ class DependencyAnalyzer:
         """Check if package should be skipped based on filter substring"""
         return self.config['filter_substring'] in package
     
+    def _simulate_package_manager_loading_order(self, start_package: str) -> List[str]:
+        """
+        Simulate a real package manager's dependency loading order
+        This uses a topological sort approach which is common in package managers
+        """
+        graph = self.dependency_graph
+
+        in_degree = defaultdict(int)
+        for package in graph:
+            in_degree[package] = 0
+        
+        for package, dependencies in graph.items():
+            for dep in dependencies:
+                if dep in graph:
+                    in_degree[dep] += 1
+        
+        queue = deque([pkg for pkg in graph if in_degree[pkg] == 0])
+        loading_order = []
+        
+        while queue:
+         
+            current = sorted(queue)[0]
+            queue.remove(current)
+            
+            if current not in loading_order:
+                loading_order.append(current)
+
+            for neighbor in graph.get(current, []):
+                if neighbor in in_degree:
+                    in_degree[neighbor] -= 1
+                    if in_degree[neighbor] == 0:
+                        queue.append(neighbor)
+        if start_package not in loading_order:
+            start_deps = graph.get(start_package, [])
+            if start_deps:
+                last_dep_index = max((loading_order.index(dep) for dep in start_deps if dep in loading_order), default=-1)
+                loading_order.insert(last_dep_index + 1, start_package)
+            else:
+                loading_order.append(start_package)
+        
+        return loading_order
+    
+    def _get_our_loading_order(self, start_package: str) -> List[str]:
+        """
+        Get our tool's dependency loading order using BFS approach
+        """
+        visited = set()
+        loading_order = []
+        queue = deque([start_package])
+        
+        while queue:
+            current = queue.popleft()
+            if current not in visited and current in self.dependency_graph:
+                visited.add(current)
+                loading_order.append(current)
+                
+                for dep in self.dependency_graph.get(current, []):
+                    if dep not in visited and dep in self.dependency_graph:
+                        queue.append(dep)
+        
+        return loading_order
+    
     def analyze_dependencies_dfs(self) -> Dict[str, Any]:
         """
         Analyze dependencies using iterative DFS algorithm
@@ -146,17 +292,15 @@ class DependencyAnalyzer:
         
         logger.info(f"Starting DFS analysis for package: {start_package}")
         logger.info(f"Max depth: {max_depth}, Filter: '{filter_substring}'")
-        
-        # For test mode, load the repository graph from file
-        if self.config['working_mode'] == 'test':
+
+        if self.config['working_mode'] in ['test', 'display_loading_order']:
             self.dependency_graph = self._load_test_repository(self.config['repository_url'])
             logger.info(f"Loaded test repository with {len(self.dependency_graph)} packages")
         else:
-            # For real analysis, this would fetch from actual repository
-            # Placeholder for future implementation
+
             self.dependency_graph = self._simulate_real_repository()
         
-        # Validate that start package exists
+
         if start_package not in self.dependency_graph:
             raise ConfigurationError(f"Package '{start_package}' not found in repository")
         
@@ -169,27 +313,20 @@ class DependencyAnalyzer:
             'skipped_packages': [],
             'visited_count': 0
         }
-        
-        # Iterative DFS implementation
         stack = deque()
-        stack.append((start_package, 0, []))  # (package, current_depth, path)
-        visited_in_path = set()  # Track visited packages in current path for cycle detection
-        all_visited = set()  # Track all visited packages
+        stack.append((start_package, 0, []))
+        visited_in_path = set()  
+        all_visited = set() 
         
         while stack:
             current_package, current_depth, current_path = stack.pop()
             
-            # Skip if package contains filter substring
             if self._should_skip_package(current_package):
                 if current_package not in results['skipped_packages']:
                     results['skipped_packages'].append(current_package)
                 continue
-            
-            # Check if we've reached max depth
             if current_depth > max_depth:
                 continue
-            
-            # Record the dependency
             dependency_info = {
                 'package': current_package,
                 'depth': current_depth,
@@ -210,26 +347,84 @@ class DependencyAnalyzer:
             
             results['dependencies'].append(dependency_info)
             all_visited.add(current_package)
-            
-            # Only explore dependencies if not cyclic and within depth limit
+
             if (not dependency_info['is_cyclic'] and 
                 current_package in self.dependency_graph and 
                 current_depth < max_depth):
-                
-                # Add to current path for cycle detection
+
                 visited_in_path.add(current_package)
-                
-                # Push dependencies to stack in reverse order to maintain DFS order
+
                 dependencies = self.dependency_graph[current_package]
                 for dep in reversed(dependencies):
-                    if dep in self.dependency_graph:  # Only explore known packages
+                    if dep in self.dependency_graph: 
                         new_path = current_path + [current_package]
                         stack.append((dep, current_depth + 1, new_path))
-                
-                # Remove from current path after processing dependencies
+ 
                 visited_in_path.discard(current_package)
         
         results['visited_count'] = len(all_visited)
+        return results
+    
+    def analyze_loading_order(self) -> Dict[str, Any]:
+        """
+        Analyze and compare dependency loading orders
+        Returns: Dict containing loading order analysis results
+        """
+        start_package = self.config['package_name']
+        
+        logger.info(f"Analyzing loading order for package: {start_package}")
+        
+        self.dependency_graph = self._load_test_repository(self.config['repository_url'])
+        logger.info(f"Loaded test repository with {len(self.dependency_graph)} packages")
+
+        if start_package not in self.dependency_graph:
+            raise ConfigurationError(f"Package '{start_package}' not found in repository")
+
+        our_loading_order = self._get_our_loading_order(start_package)
+        simulated_pm_loading_order = self._simulate_package_manager_loading_order(start_package)
+
+        discrepancies = []
+        
+
+        for i, (our_pkg, pm_pkg) in enumerate(zip(our_loading_order, simulated_pm_loading_order)):
+            if our_pkg != pm_pkg:
+                discrepancies.append({
+                    'type': 'order_mismatch',
+                    'position': i,
+                    'our_package': our_pkg,
+                    'pm_package': pm_pkg,
+                    'description': f'Position {i}: We have {our_pkg}, Package Manager has {pm_pkg}'
+                })
+
+        our_set = set(our_loading_order)
+        pm_set = set(simulated_pm_loading_order)
+        
+        missing_in_pm = our_set - pm_set
+        missing_in_our = pm_set - our_set
+        
+        for pkg in missing_in_pm:
+            discrepancies.append({
+                'type': 'missing_in_pm',
+                'package': pkg,
+                'description': f'Package {pkg} found in our analysis but missing in package manager simulation'
+            })
+        
+        for pkg in missing_in_our:
+            discrepancies.append({
+                'type': 'missing_in_our',
+                'package': pkg,
+                'description': f'Package {pkg} found in package manager simulation but missing in our analysis'
+            })
+        
+        results = {
+            'start_package': start_package,
+            'our_loading_order': our_loading_order,
+            'pm_loading_order': simulated_pm_loading_order,
+            'discrepancies': discrepancies,
+            'discrepancy_count': len(discrepancies),
+            'analysis_timestamp': datetime.now().isoformat()
+        }
+        
         return results
     
     def _simulate_real_repository(self) -> Dict[str, List[str]]:
@@ -237,13 +432,12 @@ class DependencyAnalyzer:
         Simulate a real repository for demonstration purposes
         In a real implementation, this would fetch from actual package repository
         """
-        # A sample graph with potential cycles
         return {
             'A': ['B', 'C'],
             'B': ['D', 'E'],
             'C': ['F', 'B'],
             'D': ['G'],
-            'E': ['H', 'A'],  # Cycle: A -> B -> E -> A
+            'E': ['H', 'A'],
             'F': ['I'],
             'G': ['J'],
             'H': ['K'],
@@ -296,6 +490,100 @@ class DependencyAnalyzer:
         
         print("===================================")
     
+    def display_loading_order_results(self, results: Dict[str, Any]) -> None:
+        """Display the loading order analysis results"""
+        print(f"\n=== Dependency Loading Order Analysis ===")
+        print(f"Start Package: {results['start_package']}")
+        print(f"Analysis Timestamp: {results['analysis_timestamp']}")
+        
+        print(f"\n--- Ousfr Loading Order ---")
+        for i, package in enumerate(results['our_loading_order']):
+            print(f"  {i+1:2d}. {package}")
+        
+        print(f"\n--- Simulated Package Manager Loading Order ---")
+        for i, package in enumerate(results['pm_loading_order']):
+            print(f"  {i+1:2d}. {package}")
+        
+        print(f"\n--- Discrepancies Found: {results['discrepancy_count']} ---")
+        if results['discrepancies']:
+            for discrepancy in results['discrepancies']:
+                print(f"  - {discrepancy['description']}")
+            
+            print(f"\n--- Discrepancy Explanations ---")
+            print(f"  1. Order mismatches occur due to different traversal algorithms")
+            print(f"  2. BFS vs topological sort approaches")
+            print(f"  3. Different handling of dependency resolution")
+            print(f"  4. Package manager may optimize for installation efficiency")
+        else:
+            print(f"  No discrepancies found - loading orders match!")
+        
+        print("===============================================")
+    
+    def save_results_to_file(self, results: Dict[str, Any], filename: str) -> None:
+        """Save analysis results to a JSON file"""
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            logger.info(f"Results saved to {filename}")
+        except Exception as e:
+            logger.error(f"Failed to save results to {filename}: {e}")
+    
+    def demonstrate_test_cases(self) -> None:
+        """Demonstrate various test cases with the test repository"""
+        test_cases = [
+            {
+                'name': 'Basic dependency chain',
+                'package': 'A',
+                'description': 'Simple linear dependency chain'
+            },
+            {
+                'name': 'Complex dependencies',
+                'package': 'C', 
+                'description': 'Package with multiple dependency levels'
+            },
+            {
+                'name': 'Self-contained package',
+                'package': 'M',
+                'description': 'Package with no dependencies'
+            },
+            {
+                'name': 'Circular dependencies',
+                'package': 'E',
+                'description': 'Package involved in circular dependency'
+            }
+        ]
+        
+        original_package = self.config['package_name']
+        original_mode = self.config['working_mode']
+        
+        print("\n" + "="*60)
+        print("DEMONSTRATING TEST CASES")
+        print("="*60)
+        
+        for test_case in test_cases:
+            print(f"\n--- Test Case: {test_case['name']} ---")
+            print(f"Package: {test_case['package']}")
+            print(f"Description: {test_case['description']}")
+            
+            self.config['package_name'] = test_case['package']
+            self.config['working_mode'] = 'display_loading_order'
+            
+            try:
+                results = self.analyze_loading_order()
+                self.display_loading_order_results(results)
+                
+                safe_name = test_case['name'].replace(' ', '_').lower()
+                self.save_results_to_file(
+                    results, 
+                    f"loading_order_{safe_name}_{test_case['package']}.json"
+                )
+                
+            except Exception as e:
+                print(f"  Error in test case: {e}")
+        
+        self.config['package_name'] = original_package
+        self.config['working_mode'] = original_mode
+    
     def analyze_dependencies(self) -> Dict[str, Any]:
         """
         Main analysis method that coordinates the dependency analysis
@@ -307,24 +595,54 @@ class DependencyAnalyzer:
         logger.info(f"Max depth: {self.config['max_depth']}")
         logger.info(f"Filter: {self.config['filter_substring']}")
         
-        results = self.analyze_dependencies_dfs()
-        self.display_analysis_results(results)
-        
-        return results
+        if self.config['working_mode'] == 'display_loading_order':
+            results = self.analyze_loading_order()
+            self.display_loading_order_results(results)
+            
+            # Save results
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"loading_order_{self.config['package_name']}_{timestamp}.json"
+            self.save_results_to_file(results, filename)
+            
+            return results
+        else:
+            results = self.analyze_dependencies_dfs()
+            self.display_analysis_results(results)
+            return results
 
 
 def main():
     """Main entry point of the application"""
     try:
-        analyzer = DependencyAnalyzer("config.yaml")
+        analyzer = DependencyAnalyzer("config.py")
         
         analyzer.display_configuration()
         
-        results = analyzer.analyze_dependencies()
+        if analyzer.config['working_mode'] == 'display_loading_order':
+            results = analyzer.analyze_dependencies()
+            
+            analyzer.demonstrate_test_cases()
+            
+            final_filename = f"final_loading_order_{analyzer.config['package_name']}.json"
+            analyzer.save_results_to_file(results, final_filename)
+
+            commit_message = f"feat: Add dependency loading order analysis for {analyzer.config['package_name']}"
+            if GitManager.commit_results(commit_message, [final_filename]):
+                logger.info("Results successfully committed to repository")
+            else:
+                logger.warning("Failed to commit results to repository")
+                
+        else:
+            results = analyzer.analyze_dependencies()
         
         logger.info("Stage 2 completed successfully!")
-        logger.info(f"Found {len(results['dependencies'])} dependencies")
-        logger.info(f"Detected {len(results['cyclic_dependencies'])} cyclic dependencies")
+        
+        if analyzer.config['working_mode'] == 'display_loading_order':
+            logger.info(f"Found {results['discrepancy_count']} discrepancies in loading orders")
+            logger.info("Test case demonstrations completed")
+        else:
+            logger.info(f"Found {len(results['dependencies'])} dependencies")
+            logger.info(f"Detected {len(results['cyclic_dependencies'])} cyclic dependencies")
         
         return 0
         
